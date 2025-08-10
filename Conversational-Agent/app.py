@@ -1,260 +1,219 @@
+#app.py
+
 import streamlit as st
-from dotenv import load_dotenv
-from utils.tts import synthesize_voice, play_audio, cleanup_audio_file
-from db.neo4j_client import run_cypher_query, store_product, initialize_database
-from llm.query import generate_cypher_query
-from ui.components import render_chat_button, render_header, render_info_box, render_success_message, render_error_message, render_warning_message
-
-from bs4 import BeautifulSoup
-import requests
-import time
 import os
-load_dotenv()
+from llm.conversational_agent import ConversationalAgent
+from db.neo4j_client import (
+    save_pdf_document_to_neo4j,
+    get_pdf_documents
+)
+from utils.pdf_processor import PDFProcessor
 
+# Page configuration
 st.set_page_config(
-    page_title="Neo4j AI Assistant", 
+    page_title="PDF to DB Converter with Conversational Agent", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Initialize database on startup
-try:
-    initialize_database()
-except Exception as e:
-    st.error(f"Database initialization failed: {e}")
-    st.error("Please check your Neo4j connection settings. You need to set up the following environment variables:")
-    st.code("""
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=your_password
-    """)
-    st.info("Create a .env file in your project root with these variables, or set them in your environment.")
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .conversation-bubble {
+        background: #e3f2fd;
+        padding: 1rem;
+        border-radius: 15px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #2196f3;
+    }
+    .user-bubble {
+        background: #f3e5f5;
+        border-left: 4px solid #9c27b0;
+        text-align: right;
+    }
+    .pdf-info {
+        background: #fff3e0;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #ff9800;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Render the beautiful header
-render_header()
+# Initialize session state
+if "conversational_agent" not in st.session_state:
+    st.session_state.conversational_agent = ConversationalAgent()
 
-# Sidebar for configuration
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    
-    # Database status
-    st.subheader("Database Status")
-    try:
-        # Test database connection
-        test_result = run_cypher_query("RETURN 1 as status")
-        st.success("✅ Neo4j Connected")
-    except Exception as e:
-        st.error("❌ Neo4j Connection Failed")
-        st.info("Please check your Neo4j connection settings in .env file")
-    
-    # API Status
-    st.subheader("API Status")
-    openai_key = "your_openai_api_key"  # Replace with your actual key or fetch from env
-    if openai_key:
-        st.success("✅ OpenAI API Key Configured")
-    else:
-        st.warning("⚠️ OpenAI API Key Missing")
-        api_key = st.text_input("Enter OpenAI API Key:", type="password")
-        if api_key:
-            st.session_state["OPENAI_API_KEY"] = api_key
-            st.success("✅ API Key Saved")
+if "uploaded_pdfs" not in st.session_state:
+    st.session_state.uploaded_pdfs = []
 
-# Main content
-st.header("🛒 Scrape Products from E-Commerce Page")
+if "current_chat" not in st.session_state:
+    st.session_state.current_chat = []
 
-render_info_box(
-    "Enter a product listing URL from any e-commerce site to scrape and store product information in Neo4j.",
-    "💡"
-)
+if "pdf_processor" not in st.session_state:
+    st.session_state.pdf_processor = PDFProcessor()
 
-product_url = st.text_input("Enter Product Listing URL:", placeholder="https://example.com/products")
+# Main header
+st.markdown("""
+<div class="main-header">
+    <h1>🤖 PDF to DB Converter with Conversational Agent</h1>
+    <p>Upload PDFs to Neo4j database and interact through natural conversation</p>
+</div>
+""", unsafe_allow_html=True)
 
-if st.button("🚀 Scrape Products", type="primary"):
-    if not product_url:
-        render_error_message("Please enter a valid URL")
-    else:
-        with st.spinner("🔍 Scraping product details..."):
-            def scrape_products(url):
-                try:
-                    # Use requests instead of Playwright for better compatibility
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    }
-                    response = requests.get(url, headers=headers, timeout=30)
-                    response.raise_for_status()
-                    
-                    soup = BeautifulSoup(response.content, "html.parser")
-                    scraped = 0
+# Main content area
+col1, col2 = st.columns([2, 1])
 
-                    # More generic selectors for different e-commerce sites
-                    product_selectors = [
-                        ".product-card", ".product-item", ".item", 
-                        "[data-testid*='product']", ".product", ".card"
-                    ]
-                    
-                    products_found = False
-                    for selector in product_selectors:
-                        products = soup.select(selector)
-                        if products:
-                            products_found = True
-                            render_info_box(f"Found {len(products)} products using selector: {selector}", "🔍")
-                            break
-                    
-                    if not products_found:
-                        render_warning_message("No products found with common selectors. Please check the URL or provide a different one.")
-                        return 0
-
-                    # Create a progress bar
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    for i, product in enumerate(products[:10]):  # Limit to first 10 products
-                        # Try multiple selectors for each field
-                        title_selectors = [".product-title", ".title", "h3", "h2", "[data-testid*='title']"]
-                        price_selectors = [".price", ".cost", ".amount", "[data-testid*='price']"]
-                        rating_selectors = [".rating", ".stars", "[data-testid*='rating']"]
-                        store_selectors = [".store-name", ".store", ".brand", "[data-testid*='store']"]
-                        
-                        title = None
-                        price = None
-                        rating = "N/A"
-                        store = "Unknown"
-                        
-                        # Extract title
-                        for selector in title_selectors:
-                            title_el = product.select_one(selector)
-                            if title_el:
-                                title = title_el.get_text(strip=True)
-                                break
-                        
-                        # Extract price
-                        for selector in price_selectors:
-                            price_el = product.select_one(selector)
-                            if price_el:
-                                price = price_el.get_text(strip=True)
-                                break
-                        
-                        # Extract rating
-                        for selector in rating_selectors:
-                            rating_el = product.select_one(selector)
-                            if rating_el:
-                                rating = rating_el.get_text(strip=True)
-                                break
-                        
-                        # Extract store
-                        for selector in store_selectors:
-                            store_el = product.select_one(selector)
-                            if store_el:
-                                store = store_el.get_text(strip=True)
-                                break
-
-                        if title and price:
-                            try:
-                                store_product(title, price, rating, store)
-                                scraped += 1
-                                status_text.text(f"✅ Stored: {title[:50]}...")
-                            except Exception as e:
-                                render_error_message(f"Failed to store product: {str(e)}")
-                        
-                        # Update progress
-                        progress_bar.progress((i + 1) / min(len(products), 10))
-
-                    return scraped
-                    
-                except requests.RequestException as e:
-                    render_error_message(f"Failed to fetch URL: {str(e)}")
-                    return 0
-                except Exception as e:
-                    render_error_message(f"Scraping error: {str(e)}")
-                    return 0
-
-            try:
-                total = scrape_products(product_url)
-                if total > 0:
-                    message = f"Successfully scraped and stored {total} products!"
-                    render_success_message(message)
-                    
-                    # Generate and play audio
-                    audio_path = synthesize_voice(message)
-                    if audio_path:
-                        st.audio(audio_path)
-                        play_audio(audio_path)
-                        # Clean up the audio file
-                        cleanup_audio_file(audio_path)
-                else:
-                    render_warning_message("No products were scraped. Please check the URL and try again.")
-            except Exception as e:
-                render_error_message(f"Error: {str(e)}")
-                audio_path = synthesize_voice("An error occurred while scraping.")
-                if audio_path:
-                    st.audio(audio_path)
-                    play_audio(audio_path)
-                    cleanup_audio_file(audio_path)
-
-# LLM Assistant Section
-st.markdown("---")
-st.header("💬 Ask About Products")
-
-render_info_box(
-    "Ask questions about the products in your database using natural language. The AI will generate Cypher queries to find the information you need.",
-    "🤖"
-)
-
-# Voice greeting button
-col1, col2 = st.columns([1, 4])
 with col1:
-    if st.button("🎤 Voice Greeting"):
-        greeting = "Hi! How may I help you with product information?"
-        audio_path = synthesize_voice(greeting)
-        if audio_path:
-            st.audio(audio_path)
-            play_audio(audio_path)
-            cleanup_audio_file(audio_path)
+    st.header("💬 Conversational Assistant")
+    
+    # Chat interface
+    chat_container = st.container()
+    
+    with chat_container:
+        # Display chat history
+        for message in st.session_state.current_chat:
+            if message["role"] == "user":
+                st.markdown(f"""
+                <div class="conversation-bubble user-bubble">
+                    <strong>You:</strong> {message["content"]}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="conversation-bubble">
+                    <strong>Assistant:</strong> {message["content"]}
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Display suggested actions if available
+                if "suggested_actions" in message and message["suggested_actions"]:
+                    st.write("**Suggested actions:**")
+                    for i, action in enumerate(message["suggested_actions"]):
+                        # Create a unique key using message index, action index, and action content
+                        unique_key = f"action_{len(st.session_state.current_chat)}_{i}_{action[:20].replace(' ', '_')}"
+                        if st.button(action, key=unique_key):
+                            # Add the action as a user message
+                            st.session_state.current_chat.append({
+                                "role": "user",
+                                "content": action
+                            })
+                            st.rerun()
+    
+    # User input
+    user_input = st.text_input(
+        "Ask me anything about your documents or request assistance:",
+        placeholder="e.g., 'What documents do I have?', 'Analyze the uploaded PDF', 'Help me with...'"
+    )
+    
+    if user_input:
+        # Add user message to chat
+        st.session_state.current_chat.append({
+            "role": "user",
+            "content": user_input
+        })
+        
+        # Generate response
+        with st.spinner("🤔 Thinking..."):
+            # Build context
+            pdf_context = None
+            if st.session_state.uploaded_pdfs:
+                pdf_names = [pdf['filename'] for pdf in st.session_state.uploaded_pdfs]
+                pdf_context = f"Available PDFs: {', '.join(pdf_names)}"
+            
+            graph_context = "Neo4j graph database for storing PDF documents and their content"
+            
+            # Get response from conversational agent
+            response = st.session_state.conversational_agent.generate_response(
+                user_input, pdf_context, graph_context
+            )
+            
+            # Add assistant response to chat
+            st.session_state.current_chat.append({
+                "role": "assistant",
+                "content": response["content"],
+                "suggested_actions": response.get("suggested_actions", [])
+            })
+            
+            # Rerun to display the new messages
+            st.rerun()
 
 with col2:
-    st.write("Click the button to hear a voice greeting")
-
-# Chat interface
-user_input = st.text_input("Type your question:", placeholder="e.g., Show me all products under $50")
-
-if user_input:
-    with st.spinner("🤔 Thinking..."):
-        try:
-            # Generate Cypher query
-            cypher = generate_cypher_query(user_input)
-            
-            # Display the generated query
-            with st.expander("🔍 Generated Cypher Query", expanded=False):
-                st.code(cypher, language="cypher")
-            
-            # Execute the query
-            results = run_cypher_query(cypher)
-            
-            # Display results
-            st.subheader("📊 Results")
-            if results:
-                st.json(results)
+    st.header("📚 PDF Management")
+    
+    # PDF Upload Section
+    st.subheader("📄 Upload PDF")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file", 
+        type=['pdf'], 
+        help="Upload a PDF document for analysis and storage"
+    )
+    
+    if uploaded_file is not None:
+        if st.button("🔍 Process & Store PDF"):
+            with st.spinner("Processing PDF..."):
+                # Process the PDF
+                pdf_data = st.session_state.pdf_processor.extract_text_from_pdf(uploaded_file)
                 
-                # Create a summary
-                summary = f"Found {len(results)} results for your query."
-                render_success_message(summary)
-                
-                # Generate and play audio
-                audio_path = synthesize_voice(summary)
-                if audio_path:
-                    st.audio(audio_path)
-                    play_audio(audio_path)
-                    cleanup_audio_file(audio_path)
-            else:
-                render_warning_message("No results found for your query.")
-                
-        except Exception as e:
-            render_error_message(f"LLM Query Failed: {e}")
-            audio_path = synthesize_voice("Sorry, I couldn't understand that.")
-            if audio_path:
-                st.audio(audio_path)
-                play_audio(audio_path)
-                cleanup_audio_file(audio_path)
+                if pdf_data:
+                    # Extract key information
+                    pdf_data['key_info'] = st.session_state.pdf_processor.extract_key_information(
+                        pdf_data['extracted_text']
+                    )
+                    
+                    # Save to Neo4j
+                    try:
+                        save_pdf_document_to_neo4j(pdf_data)
+                        st.session_state.uploaded_pdfs.append(pdf_data)
+                        st.success(f"✅ PDF '{pdf_data['filename']}' processed and stored successfully!")
+                        
+                        # Add to conversation
+                        st.session_state.conversational_agent.add_message(
+                            "system", 
+                            f"New PDF uploaded: {pdf_data['filename']} with {pdf_data['total_pages']} pages"
+                        )
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error saving to database: {str(e)}")
+                else:
+                    st.error("❌ Failed to process PDF")
+    
+    # View Uploaded PDFs
+    st.subheader("📋 Uploaded Documents")
+    if st.session_state.uploaded_pdfs:
+        for pdf in st.session_state.uploaded_pdfs:
+            with st.expander(f"📄 {pdf['filename']}"):
+                st.write(f"**Title:** {pdf['metadata']['title']}")
+                st.write(f"**Pages:** {pdf['total_pages']}")
+                st.write(f"**Words:** {pdf['key_info']['estimated_word_count']}")
+                if pdf['key_info']['main_topics']:
+                    st.write(f"**Topics:** {', '.join(pdf['key_info']['main_topics'][:3])}")
+    else:
+        st.info("No PDFs uploaded yet.")
+    
+    # Conversation Controls
+    st.subheader("💬 Conversation")
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state.current_chat = []
+        st.session_state.conversational_agent.clear_history()
+        st.rerun()
+    
+    if st.button("📊 View Chat Summary"):
+        summary = st.session_state.conversational_agent.get_conversation_summary()
+        st.text_area("Chat Summary", summary, height=200)
 
-# Render the floating chat button
-render_chat_button()
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666;'>
+    <p>🤖 Powered by OpenAI GPT-4 | 🗄️ Neo4j Graph Database | 📄 PDF Processing</p>
+</div>
+""", unsafe_allow_html=True)
